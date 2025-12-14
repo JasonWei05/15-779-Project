@@ -93,8 +93,7 @@ python bench/scripts/benchmark_chunk_attn_sweep.py \
   --csv results/chunk_attn_native/sweep_native.csv
 
 # If you use the Bridges2 conda env from the paper setup, you can also do:
-/jet/home/billyli/data_billyli/jason/miniconda3/bin/conda run -n cot \
-  python bench/scripts/benchmark_chunk_attn_sweep.py \
+python bench/scripts/benchmark_chunk_attn_sweep.py \
   --csv results/chunk_attn_native/sweep_native.csv
 ```
 
