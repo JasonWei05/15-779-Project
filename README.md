@@ -1,4 +1,4 @@
-# 15-779 Project: Prefix-Aware Attention (Bench Harness + Results)
+# 15-779 Project: Prefix-Aware Attention
 
 This repository contains:
 - **`chunk-attention-tk/`**: the ChunkAttention + ThunderKittens codebase (vendored).
