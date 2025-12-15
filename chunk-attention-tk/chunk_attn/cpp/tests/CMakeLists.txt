@@ -4,6 +4,11 @@ if (USE_CUDA)
             PRIVATE
             test_gpu_kernel.cpp
     )
+
+    add_executable(bench_chunk_first_kernel bench_chunk_first_kernel.cpp)
+    target_link_libraries(bench_chunk_first_kernel
+            PRIVATE
+            chunk_attn_lib)
 endif ()
 if (USE_MKL)
     target_sources(test_chunk_attn

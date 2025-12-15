@@ -22,8 +22,12 @@
 #include "kittens.cuh"
 using namespace kittens;
 
-// Configuration: 2 warps for row parallelism (TK tiles require rows ≥ 16)
-constexpr int NUM_WARPS = 2;
+// Configuration:
+// - 2 "compute" warps do the math (row-parallel: each warp handles max_n_seqs/2 rows)
+// - 2 extra warps are used only to assist cooperative global->shared loads of K/V
+//   (this is the "4-warp" variant used for sweep_kv_4warp.csv)
+constexpr int COMPUTE_WARPS = 2;
+constexpr int NUM_WARPS = 4;
 constexpr int BLOCK_SIZE = NUM_WARPS * 32;
 
 /**
@@ -53,8 +57,8 @@ struct attn_chunk_first_globals {
 template<int max_n_seqs, int chunk_size, int d_head>
 __global__ void __launch_bounds__(BLOCK_SIZE)
 attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs, d_head> g) {
-    static_assert(max_n_seqs % NUM_WARPS == 0, "max_n_seqs must be divisible by NUM_WARPS");
-    constexpr int ROWS_PER_WARP = max_n_seqs / NUM_WARPS;
+    static_assert(max_n_seqs % COMPUTE_WARPS == 0, "max_n_seqs must be divisible by COMPUTE_WARPS");
+    constexpr int ROWS_PER_WARP = max_n_seqs / COMPUTE_WARPS;
 
     // Thread indexing
     const int head = blockIdx.x;
@@ -75,12 +79,12 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
 
-    // K, V shared by all warps; Q, scores, output per-warp
+    // K, V shared by all warps; Q, scores, output per compute-warp
     st<bf16, chunk_size, d_head> &K_s = al.allocate<st<bf16, chunk_size, d_head>>();
     st<bf16, chunk_size, d_head> &V_s = al.allocate<st<bf16, chunk_size, d_head>>();
-    auto &Q_s = al.allocate<st<bf16, ROWS_PER_WARP, d_head>, NUM_WARPS>()[warp];
-    auto &scores_s = al.allocate<st<float, ROWS_PER_WARP, chunk_size>, NUM_WARPS>()[warp];
-    auto &out_s = al.allocate<st<float, ROWS_PER_WARP, d_head>, NUM_WARPS>()[warp];
+    auto &Q_s_all = al.allocate<st<bf16, ROWS_PER_WARP, d_head>, COMPUTE_WARPS>();
+    auto &scores_s_all = al.allocate<st<float, ROWS_PER_WARP, chunk_size>, COMPUTE_WARPS>();
+    auto &out_s_all = al.allocate<st<float, ROWS_PER_WARP, d_head>, COMPUTE_WARPS>();
 
     // =========================================================================
     // Load K, V (cooperative across all threads)
@@ -100,14 +104,20 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     // =========================================================================
     const bf16* Q_base = g.Q + seq_begin * g.n_heads * d_head + head * d_head;
 
-    for (int r = 0; r < ROWS_PER_WARP; r++) {
-        int global_row = my_row_start + r;
-        for (int c = lane; c < d_head; c += 32) {
-            Q_s[{r, c}] = (global_row < n) ? Q_base[global_row * g.n_heads * d_head + c]
-                                           : __float2bfloat16(0.0f);
+    if (warp < COMPUTE_WARPS) {
+        auto &Q_s = Q_s_all[warp];
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            int global_row = my_row_start + r;
+            for (int c = lane; c < d_head; c += 32) {
+                Q_s[{r, c}] = (global_row < n) ? Q_base[global_row * g.n_heads * d_head + c]
+                                               : __float2bfloat16(0.0f);
+            }
         }
     }
     __syncthreads();
+
+    // Only the first two warps participate in compute. The extra warps were only for K/V loads.
+    if (warp >= COMPUTE_WARPS) return;
 
     // =========================================================================
     // Compute scores = Q @ K^T * scale
@@ -115,6 +125,10 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     // =========================================================================
     rt<bf16, ROWS_PER_WARP, d_head> Q_r;
     rt<bf16, chunk_size, d_head> K_r;
+    auto &Q_s = Q_s_all[warp];
+    auto &scores_s = scores_s_all[warp];
+    auto &out_s = out_s_all[warp];
+
     warp::load(Q_r, Q_s);
     warp::load(K_r, K_s);
 
