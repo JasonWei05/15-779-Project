@@ -1,0 +1,403 @@
+%%%%%%%% mlsys 2025 EXAMPLE LATEX SUBMISSION FILE %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs} % for professional tables
+
+\usepackage{hyperref}
+
+% hyperref makes hyperlinks in the resulting PDF.
+% If your build breaks (sometimes temporarily if a hyperlink spans a page)
+% please comment out the following usepackage line and replace
+% \usepackage{mlsys2025} with \usepackage[nohyperref]{mlsys2025} above.
+% \usepackage{hyperref}final
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+% \usepackage{mlsys2025}
+\usepackage{amsmath}
+\usepackage{amssymb}
+% If accepted, instead use the following line for the camera-ready submission:
+\usepackage[accepted]{mlsys2025}
+
+% The \mlsystitle you define below is probably too long as a header.
+% Therefore, a short form for the running title is supplied here:
+\mlsystitlerunning{Optimizing Prefix Attention with ThunderKittens Kernels}
+
+\begin{document}
+
+\twocolumn[
+\mlsystitle{Optimizing Prefix Attention with ThunderKittens Kernels}
+
+% It is OKAY to include author information, even for blind
+% submissions: the style file will automatically remove it for you
+% unless you've provided the [accepted] option to the mlsys2025
+% package.
+
+% List of affiliations: The first argument should be a (short)
+% identifier you will use later to specify author affiliations
+% Academic affiliations should list Department, University, City, Region, Country
+% Industry affiliations should list Company, City, Region, Country
+
+% You can specify symbols, otherwise they are numbered in order.
+% Ideally, you should not use this facility. Affiliations will be numbered
+% in order of appearance and this is the preferred way.
+\mlsyssetsymbol{equal}{*}
+
+\begin{mlsysauthorlist}
+\mlsysauthor{Ayush Kumar}{cmu}
+\mlsysauthor{Jackson Romero}{cmu}
+\mlsysauthor{Jaosn Wei}{cmu}
+% \mlsysauthor{Iaesut Saoeu}{ed}
+% \mlsysauthor{Fiuea Rrrr}{to}
+% \mlsysauthor{Tateu H.~Yasehe}{ed,to,goo}
+% \mlsysauthor{Aaoeu Iasoh}{goo}
+% \mlsysauthor{Buiui Eueu}{ed}
+% \mlsysauthor{Aeuia Zzzz}{ed}
+% \mlsysauthor{Bieea C.~Yyyy}{to,goo}
+% \mlsysauthor{Teoau Xxxx}{ed}
+% \mlsysauthor{Eee Pppp}{ed}
+\end{mlsysauthorlist}
+
+\mlsysaffiliation{cmu}{Carnegie Mellon University}
+
+% \mlsyscorrespondingauthor{Cieua Vvvvv}{c.vvvvv@googol.com}
+% \mlsyscorrespondingauthor{Eee Pppp}{ep@eden.co.uk}
+
+% You may provide any keywords that you
+% find helpful for describing your paper; these are used to populate
+% the "keywords" metadata in the PDF but will not be shown in the document
+\mlsyskeywords{Machine Learning, MLSys}
+
+\vskip 0.3in
+
+\begin{abstract}
+Large language model inference workloads frequently consist of processing batches of sequences sharing a common prefix. Our project aims to implement an automatic prefix caching (APC) approach to KV cache reuse using highly performant kernels written in ThunderKittens (TK), a domain-specific language for GPU programming. We design and evaluate TK kernels built for existing approaches to prefix caching, as presented in the Hydragen and ChunkAttention frameworks. Our goal in this project is to try to use TK's tile-level optimizations and explicit primitives for Tensor Core utilization and improve the throughput of existing prefix attention mechanisms. We evaluate candidate TK kernels for each approach, presenting results at different input batch/sequence lengths, prefix configurations, and an analysis of our performance against existing benchmarks. \end{abstract}
+]
+
+% this must go after the closing bracket ] following \twocolumn[ ...
+
+% This command actually creates the footnote in the first column
+% listing the affiliations and the copyright notice.
+% The command takes one argument, which is text to display at the start of the footnote.
+% The \mlsysEqualContribution command is standard text for equal contribution.
+% Remove it (just {}) if you do not need this facility.
+
+%\printAffiliationsAndNotice{}  % leave blank if no need to mention equal contribution
+% \printAffiliationsAndNotice{\mlsysEqualContribution} % otherwise use the standard text.
+
+\section{Introduction}
+\label{submission}
+
+As large language models (LLMs) are utilized in a multitude of scenarios for multi-step and context-rich tasks such as code generation, there is a growing interest in optimizing inference at scale. Given that certain tasks require more complex reasoning (due to task difficulty) or a multi-step chain of thought (due to compound tasks), most providers are opting for inference-time augmentations such latent thinking steps \cite{wei2023} and few-shot prompting \cite{brown2020}.   
+
+These inference-time steps, while improving model performance, introduce a critical computational bottleneck: many sequences processed in a single batch share substantial common prefixes. For instance, in few-shot prompting scenarios, dozens of user queries may be prepended with identical demonstration examples. Similarly, agentic workflows and structured generation tasks often involve repeated system prompts or contextual information across multiple requests. The redundant computation of attention over these shared prefixes represents a significant inefficiency in modern LLM serving systems.
+
+Modern implementations of the transformer architecture utilize a key-value cache \cite{pope2022} to store attention keys and values to avoid recomputation across autoregressive generation steps. By recognizing and exploiting prefix overlap across sequences in a batch, inference systems can dramatically reduce both computational costs and memory bandwidth requirements.
+
+ChunkAttention \cite{chunk} proposed prefix-aware KV cache and an efficient 2-phase partition approach to computing self-attention. Similarly, Hydragen \cite{hydra} proposes a decomposition and sequence batching approach to compute attention optimally across the suffix and the prefix. 
+
+While there are other approaches to managing shared prefixes, we choose to work with the above two frameworks because their attention calculation consists of a prefix-suffix step, which can be represented (non-optimally) as multiple matrix-vector products. This computation does not use the tensor cores available in modern GPUs such as the H100 efficiently. While both ChunkAttention and Hydragen do batching of the shared prefix queries, tensor core utilization can be improved by modifying their attention kernels to make use of better tile-level abstractions that better map tensor operations at the hardware level.  
+
+We opt to rewrite the kernels being used for attention in these frameworks with Thunder Kittens (TK) \cite{tk}. TK’s various tile-level optimizations and explicit primitives for Tensor Core utilization allow us to improve hardware utilization and reduce latency during the decoding phase. 
+
+\section{Problem}
+The core problem that our project aims to solve is the underutilization of tensor cores in prefix-aware attention computation. There are several bottlenecks in the current implementations of ChunkAttention and Hydragen, which we hope to improve.
+\subsection{Redundant Computation in Prefix-Aware Decoding}
+Standard attention computes independently for each sequence, leading to redundant computation and memory access patterns. Hydragen and ChunkAttention enable efficient attention computation across a shared prefix. This helps speed up the prefill phase, where the prompt prefix is often shared across multiple independent queries. The problem, however, stems from the decoding phase, where the system computes attention over mismatched suffix tokens. Current approaches use regular self-attention kernels for this phase, which do not always provide good utilization of Tensor Cores. We propose to solve this problem by writing specialized kernels for prefix-aware decoding using TK.
+\subsection{Hardware Underutilization}
+Modern GPUs such as the H100 feature specialized tensor cores capable of significantly improving throughput for matrix multiplications than traditional CUDA cores. However, current prefix-aware attention implementations such as in ChunkAttention and Hydragen rely on general-purpose kernels (e.g. FlashAttention). This might be because the implementations target broader hardware compatibility. We aim to improve utilization on specialized hardware such as the H100 using custom TK kernels. 
+\subsection{Implementation Complexity}
+Writing specialized kernels for Tensor Core utilization introduces
+significant implementation complexity if there is not much support at the kernel language level. We choose TK because it provides an extensible framework on top of CUDA to operate on tiles with useful hardware primitives, such as asynchronous warp-level matrix multiply-and-accumulate (WGMMA) calls, and register/shared tiles. We think that TK strikes a good abstraction balance in that we can access complex hardware instructions but fall back to the tile-based abstraction as our mental model. This allows us to try to write the attention kernels in a more TMA-optimal manner without having to rely on complex hardware instructions.
+\section{Related work}
+Existing work in the area of automatic prefix caching (APC) and KV cache reuse include PagedAttention \cite{paged}, ChunkAttention, and Hydragen. PagedAttention borrows from ideas in virtual memory to avoid redundant storage of prefixes, using page-level storage of KV tensors. However, PagedAttention does not prevent redundant reads of the prefix’s keys and values from GPU memory. ChunkAttention uses a prefix-aware KV cache and the two-phase partition kernel for computing self-attention, which splits the attention computation into the shared prefix (chunk-first phase) and the unique suffix (sequence-first). The limitation of this approach is that the sequence-first approach attends to unique suffix tokens as query vectors, instead of matrices, which is critical as it does not allow us to exploit full utilization of the matmul Tensor Cores. Also, the kernel used in this approach is a highly specialized CUDA kernel tuned to a specific hardware and model configuration. Using a TK kernel would allow us to port to any hardware with Tensor Cores and would also allow developers to code in a native PyTorch-like environment. Finally, Hydragen utilizes an attention decomposition and sequence batching approach to manage attention between suffix and prefix. Hydragen uses a Triton kernel for this purpose. We anticipate that using TK’s various tile-level optimizations and explicit primitives for Tensor Core utilization will allow us to further reduce latency during the decoding phase.
+\subsection{Hydragen}
+\subsection{ChunkAttention} \label{sec:chunk_intro}
+ChunkAttention addresses prefix-aware attention through a two-phase partition approach that separates computation across shared prefixes and unique suffixes. The algorithm divides the attention computation into two distinct phases:
+
+\textbf{Phase 1: Chunk-First.} In this phase, the system processes shared prefix chunks by batching queries from multiple sequences together. Given a batch of sequences sharing a common prefix, the prefix is divided into fixed-size chunks (typically 64 tokens). For each chunk, queries from all sequences are processed together as a matrix operation against the chunk's keys and values. This transforms what would otherwise be $n$ independent matrix-vector products into a single matrix-matrix multiplication, enabling efficient utilization of GPU tensor cores. The phase outputs partial attention results (unnormalized attention outputs, max values, and sum values) for each sequence-chunk pair.
+
+\textbf{Phase 2: Sequence-First.} This phase handles the unique suffix tokens where sequences diverge. Each sequence is processed independently, computing attention over its suffix tokens one sequence at a time. The kernel reuses the cached partial results from the chunk-first phase for the shared prefix and computes fresh attention for the unique suffix tokens. Online softmax rescaling combines the prefix and suffix attention outputs to produce the final result.
+
+The two-phase decomposition exploits the key insight that shared prefixes enable batched computation (compute-bound), while unique suffixes require per-sequence processing (memory-bound). ChunkAttention-TK implements both phases using ThunderKittens kernels to maximize hardware utilization on modern GPUs.
+
+
+\section{Overview}
+As our project aims to improve existing implementations for shared prefix attention at the kernel-level, we do not propose any modifications to the core algorithms proposed by the Chunk Attention and Hydragen frameworks. 
+
+At a high level, our project consists of two parts, Hydragen-TK, our implementation of a TK kernel for Hydragen, and ChunkAttention-TK, a TK kernel for ChunkAttention.
+\subsection{System Overview: Hydragen-TK}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.5\linewidth]{mlsys2025style//images/hydra_overview.png}
+    \caption{Hydragen TK Overview}
+    \label{fig:placeholder}
+\end{figure}
+\subsection{System Overview: ChunkAttention-TK}
+\subsubsection{Overview: ChunkAttention Algorithm}
+The ChunkAttention algorithm partitions attention computation across shared and unique portions of input sequences. As described in Section \ref{sec:chunk_intro}, the chunk-first phase processes shared prefix chunks using batched matrix operations, while the sequence-first phase processes unique suffix tokens using per-sequence computation with cached prefix results.
+
+The original ChunkAttention implementation uses hand-optimized CUDA kernels with Warp Matrix Multiply Accumulate (WMMA) instructions, fp16 precision, and 128 threads (4 warps) per block. Our contribution reimplements both kernels using ThunderKittens to explore whether TK's tile-based abstractions and warpgroup primitives can improve performance while simplifying the implementation.
+
+\subsubsection{ThunderKittens Kernel Implementation}
+We developed two TK kernels corresponding to the two-phase partition:
+
+\textbf{Chunk-First Kernel (\texttt{attn\_chunk\_first\_tk}):} This kernel computes attention for a single chunk of the shared prefix across all sequences in the batch. The computation follows the standard attention pattern: $\text{scores} = QK^T \cdot \text{scale}$, followed by row-wise softmax (outputting max and sum for later rescaling), and finally $\text{attn} = \text{softmax}(QK^T)V$. The kernel leverages TK's warpgroup matrix multiply (\texttt{warpgroup::mm\_ABt} and \texttt{warpgroup::mma\_AB}) for the two matrix multiplications and warp-level primitives for softmax operations. The grid is configured as $(n\_heads, n\_chunks)$ with 4 warps per block.
+
+\textbf{Sequence-First Kernel (\texttt{attn\_seq\_first\_tk}):} This kernel computes the final attention output for a single sequence by combining cached chunk-first results with fresh computation over unique suffix tokens. The kernel processes chunks in a round-robin fashion across warps: for shared chunks, it retrieves cached attention outputs and uses online softmax rescaling to merge them; for unique chunks, it computes fresh attention using scalar dot products for $QK^T$ (since each query is a single vector). The grid is configured as $(n\_heads, n\_seqs)$ with 4 warps per block.
+
+Both kernels use bf16 precision for improved H100 compatibility and TK's shared memory allocators for proper tile layout and swizzling.
+
+
+\section{Methodology}
+\subsection{Hydragen-TK}
+\subsubsection{Overview: Hydragen Algorithm}
+As mentioned above, Hydragen optimizes LLM inference for batches with shared prefixes using two key techniques: 
+\begin{enumerate}
+    \item Attention Decomposition: The attention computation is split into separate computations over shared prefixes and unique suffixes, which are combined using log-sum-exp values.
+    \item Inter-Sequence Batching: For shared prefix attention, queries from different sequences are batched together. This transforms memory-bound
+  matrix-vector products into compute-bound matrix-matrix products.
+\end{enumerate}
+The original Hydragen implementation uses PyTorch for decomposition logic and Triton for attention kernels. Our contribution is re-implementing the attention kernels using 
+  ThunderKittens to explore whether TK's tile-based abstraction and explicit Tensor Core primitives can provide comparable performance with simpler code.
+
+  The log-sum-exp is defined as \begin{equation}
+\text{LSE}(Q, K) = \log \sum_{j=1}^{N_k} \exp\left(\frac{(QK^T)_{ij}}{\sqrt{d}}\right)\end{equation}
+As is presented in the paper, we can take the attention outputs and the LSEs from the partitioned computation and using rescaling, compute the the full-sequence softmax denominator.
+
+\subsubsection{ThunderKittens Kernel Implementation}
+We adopt the use of the ThunderKittens' attention kernel \verb|tk.mha_forward|. TK imposes hardware-specific constraints for its H-100 optimized multi-head attention kernel that we discovered through experimentation and limited documentation such as:
+\begin{itemize}
+    \item Self-attention requiring matching query-key sequence lengths
+    \item 192-token alignment (tile size) for the attention kernel
+    \item \verb|bfloat16| data type for all inputs
+    \item 64/128-dim attention heads required by TK's API for \verb|tk.mha_forward|
+\end{itemize}
+
+We modified the Hydragen source to launch the MHA kernel defined in TK instead of the Triton FlashAttention kernel as is in the original code. We utilized a padding to satisfy the 192-token alignment as required by the TK kernel, and setup additional checks to make sure that the instance satisfies the other runtime constraints before launching the TK kernel. As a fallback, we call the Triton Flash Attention kernel as in the original implementation. 
+
+As TK's documentation is currently still a work in progress, we were limited to a few resources such as this \href{https://docs.google.com/document/d/15-Zvf6e0NLX1si4ml4sUOWCDlXNMtOWKiuo6CKZMEYA/edit?tab=t.0#heading=h.9t3n4v42ayve}{onboarding document}. It was not a trivial task to get specific documentation for parts of the API, and we used the onboarding document as well as the sample kernels provided in the TK public GitHub as a reference when implementing our kernels.
+
+\subsubsection{TK Adapter for Hydragen}
+In order to integrate the TK kernel correctly into Hydragen's interface, we needed to build a minimal adapter layer to act as a bridge between the actual and expected inputs. The steps involved in the transformation of the inputs and outputs are as follows:
+\begin{enumerate}
+    \item Cast inputs to \verb|bfloat16|
+    \item Transpose inputs \verb|(B, N, H, D) -> (B, H, N, D)|
+    \item  Do a similar (reverse) transpose in the outputs
+     \item Process the LSE in the output by squeezing the last dimension and transposing LSE \verb|(B, H, N, 1) -> (B, N, H)|
+\end{enumerate}
+   
+    An additional optimization we tried at input preparation stage was using \verb|.contiguous()| to ensure contiguous memory for the queries, keys, and values to maximize data locality.
+
+\subsection{ChunkAttention-TK}
+
+\subsubsection{Chunk-First Kernel Implementation}
+The chunk-first kernel processes a single chunk of the shared prefix across all sequences in a batch. We configure the kernel with a grid of $(n\_heads, n\_chunks)$ and 4 warps per block (128 threads), matching the original implementation.
+
+\textbf{Memory Management and Data Loading.}
+A key challenge arose from ChunkAttention's KV cache organization: keys and values are stored as arrays of void pointers (\texttt{void**}) to support flexible per-chunk allocation. TK's Tensor Memory Accelerator (TMA) requires contiguous global memory with compile-time strides, making TMA incompatible with this pointer-based layout. We addressed this by implementing a hybrid loading strategy: Queries use TMA (via \texttt{tma::load\_async}) since they have regular strided layout, while Keys and Values use custom asynchronous copy routines with \texttt{cp.async} instructions.
+
+To reduce shared memory consumption, we reuse the same buffer for K and V tiles—they are never needed simultaneously since K is consumed during $QK^T$ computation before V is loaded for the final matrix multiply. This optimization reduces shared memory usage by 40\% compared to separate allocations.
+
+\textbf{Warpgroup Matrix Operations.}
+The kernel leverages TK's warpgroup-level matrix multiply primitives for the two main computations. For $QK^T$, we use \texttt{warpgroup::mm\_ABt(scores\_r, Q\_s, KV\_s)} which maps directly to H100's WGMMA instructions. After computing softmax using warp-level primitives (\texttt{warp::row\_max}, \texttt{warp::exp}, \texttt{warp::row\_sum}), we compute the final attention output with \texttt{warpgroup::mma\_AB(out\_r, exp\_scores, KV\_s)}.
+
+This design contrasts with the native CUDA kernel, which uses hand-written WMMA fragment operations and manual shared memory management with custom padding. TK's tile abstractions automatically handle swizzling for bank conflict avoidance and provide higher-level warpgroup operations, simplifying the implementation while enabling better instruction selection on H100.
+
+\subsubsection{Sequence-First Kernel Implementation}  
+The sequence-first kernel computes the final attention output for a single sequence by combining cached chunk-first results with fresh computation over unique suffix tokens. We configure the grid as $(n\_heads, n\_seqs)$ with 4 warps per block.
+
+\textbf{Scalar Dot Product Pattern.}
+Each sequence processes one query vector against multiple chunks, resulting in a fundamentally different computational pattern than chunk-first. For each chunk, the kernel computes $QK^T$ using scalar dot products: we iterate over each row of K and perform element-wise multiplication with Q, followed by warp-level reduction (\texttt{\_\_shfl\_down\_sync}) to sum the products. This row-by-row processing cannot leverage matrix-tiled operations or tensor cores.
+
+\textbf{Online Softmax and Result Merging.}
+Warps process chunks in round-robin fashion. For shared prefix chunks ($\text{chunk\_idx} < n\_shared\_chunks$), the kernel retrieves cached partial results (max, sum, unnormalized attention) from chunk-first and uses online softmax rescaling to merge them:
+\begin{align*}
+m_{\text{new}} &= \max(m_{\text{prev}}, m_{\text{cached}}) \\
+\text{scale}_{\text{prev}} &= \exp(m_{\text{prev}} - m_{\text{new}}) \\
+\text{scale}_{\text{cached}} &= \exp(m_{\text{cached}} - m_{\text{new}}) \\
+\text{out} &= \text{out} \cdot \text{scale}_{\text{prev}} + \text{cached\_attn} \cdot \text{scale}_{\text{cached}}
+\end{align*}
+
+For unique suffix chunks, the kernel computes fresh attention using the scalar dot products described above. TK's warp primitives (\texttt{warp::max}, \texttt{warp::sum}, \texttt{warp::exp}) simplify this online softmax implementation compared to the native kernel's manual shuffle operations, though they cannot overcome the fundamental limitation: without matrix-matrix multiplies, tensor core utilization remains minimal.
+
+After all chunks are processed, warp 0 performs cross-warp reduction to normalize the final output and writes the result to global memory.
+
+\subsubsection{Correctness Validation}
+We validated both kernels against the native CUDA implementations using 36 test configurations spanning different batch sizes (16-128), chunk counts (4-64), and head dimensions (128). We consistently observed some tests failing, but believe that this is due to numerical precision. All of our tests that use small-valued tensors pass and only when using values across the whole range of \verb|bf16| did we indices with noticeable, but still small, differences. The test harness runs a basic PyTorch-based computation to check equivalence.
+
+\section{Evaluation}
+\subsection{Hydragen-TK}
+\subsubsection{Correctness}
+Given that our project attempts to swap out existing kernels for optimized TK kernels in the Hydragen framework, along with any relevant speedup, we needed to verify the correctness of our implementation. We implemented two test scenarios in to verify correctness:
+\begin{enumerate}
+    \item Unique Prefill (Self-Attention): This test validates that the kernel produces numerically correct results for standard self-attention during the prefill phase, without using shared prefixes. The purpose of this test was to make sure that the invocation of Tk self-attention kernels was correct using the appropriate tensor shapes and parameters. 
+    \item Shared Prefix Attention: In this test, we used standard long prompt where Q and K are the same length and checked for numerical equivalence between the reference implementation (provided in the Hydragen code) as well as our implementation of shared prefix attention. This test ensures the correctness of our attention kernel when used after attention decomposition in Hydragen-TK.
+\end{enumerate}
+In both implementations, we tested with references using PyTorch and Triton attention kernels and used a tolerance for error of $0.05$.  
+
+\subsubsection{Experimental Setup}
+\begin{itemize}
+    \item Hardware: H100 GPU
+    \item Framework: PyTorch 2.8, ThunderKittens version 3.0
+    \item Baseline: FlashAttention-2
+    \item Configuration: B=16, S=768,
+  H=16, D=128, TK using bfloat16
+\end{itemize}
+
+\subsubsection{Performance Results}
+
+\begin{table}[htb!]
+  \centering
+  \caption{Latency Comparison (100 iterations, 10 warmup)}
+  \label{tab:latency}
+  \begin{tabular}{lc}
+  \toprule
+  \textbf{Implementation} & \textbf{Latency (ms)} \\
+  \midrule
+  Hydragen-TK (H100) & 0.85 $\pm$ 0.01 \\
+  FlashAttention (Baseline) & 0.59 $\pm$ 0.01 \\
+  \bottomrule
+  \end{tabular}
+  \end{table}
+
+  \begin{table}[htb!]
+  \centering
+  \caption{Throughput Comparison (100 iterations, 10 warmup)}
+  \label{tab:throughput}
+  \begin{tabular}{lc}
+  \toprule
+  \textbf{Implementation} & \textbf{Throughput (TFLOPS)} \\
+  \midrule
+  Hydragen-TK (H100) & 91.09 \\
+  FlashAttention (Baseline) & 130.62 \\
+  \bottomrule
+  \end{tabular}
+  \end{table}
+
+From the above results, we can see that the modified TK kernels did not provide any speedup: rather, they incurred 40\% overhead when compared to FlashAttention-2. The reason for this could be the expensive input/output data transformations in the adapter required to bridge between Hydragen and TK's \verb|tk.mha_forward| kernel. Since the extra transformation steps include several reshapes, as well as a cast, this results in a higher overhead in launching each kernel.
+
+In order to tune the performance of our TK kernel, we tried several approaches. First, we enforced that the key, values and queries were stored in contiguous storage, and optimization that provided upto 5\% speedup.
+
+\subsection{ChunkAttention-TK}
+\subsubsection{Experimental Setup}
+\begin{itemize}
+    \item Hardware: H100 GPU (80GB HBM3)
+    \item Framework: ThunderKittens 3.0, CUDA 12.4
+    \item Baseline: Native CUDA kernels (fp16)
+    \item Config: \text{n\_seqs=64, chunk\_size=64, d\_head=128, bf16}
+    \item Sweep: n\_heads $\in$ \{4, 8, 16, 32, 64, 128, 256\}, n\_chunks $\in$ \{4, 8, 16, 32, 64, 128, 256\}
+\end{itemize}
+
+We benchmark both the chunk-first and sequence-first kernels using kernel-only timing (CUDA events) to isolate kernel performance from framework overhead.
+
+\subsubsection{Chunk-First Kernel Performance}
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=1.0\linewidth]{mlsys2025style/images/chunk_scaling_combined_compare.png}
+    % \includegraphics[width=0.45\linewidth]{results/chunk_attn_tk/chunk_first_vs_native_kernel_only/latency_compare.png}
+    \caption{Chunk-First: TK vs Native kernel-only comparison. Left: Latency (ms) vs blocks. Right: Throughput (TFLOPS) vs blocks.}
+    \label{fig:chunk_first_perf}
+\end{figure}
+
+The TK chunk-first kernel demonstrates significant performance advantages over the native implementation across all scales (Figure~\ref{fig:chunk_first_perf}). At 4,096 blocks, the TK kernel achieves 68.5 TFLOPS compared to 43.6 TFLOPS for native—a \textbf{1.6× speedup}. The speedup is even more pronounced at smaller scales, reaching \textbf{2.0×} at 256 blocks.
+
+This performance advantage indicates that TK's warpgroup MMA operations provide better instruction throughput than the native kernel's WMMA-based approach. The TK kernel achieves 7.5\% of H100's theoretical dense bf16 tensor core peak (989 TFLOPS), with throughput scaling nearly linearly as the workload grows. Memory bandwidth efficiency reaches 34.7\% of peak HBM3 bandwidth at the largest scale, suggesting the kernel is transitioning from compute-bound to memory-bound behavior.
+
+\subsubsection{Sequence-First Kernel Performance}
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=1.0\linewidth]{mlsys2025style/images/seq_scaling_combined_compare.png}
+    \caption{Sequence-First: Left: Latency (ms) vs blocks. Right: Throughput (TFLOPS) vs blocks.}
+    \label{fig:seq_first_perf}
+\end{figure}
+
+The sequence-first kernel achieves significantly lower throughput than chunk-first, plateauing at approximately 2.3 TFLOPS (0.23\% of peak) regardless of scale (Figure~\ref{fig:seq_first_perf}). This is an unfortunate consequence of how we designed the TK kernel: the kernel processes one query vector per sequence, resulting in vector-matrix products rather than matrix-matrix multiplies. Without matrix-tiled operations, the kernel cannot effectively utilize tensor cores.
+
+Compared to chunk-first, sequence-first is approximately \textbf{30× slower} in terms of TFLOPS (68.5 vs 2.3 at 4096 blocks). The sequence-first kernel's performance is primarily memory-bandwidth-limited, as evidenced by its consistent throughput across scales. The scalar dot product pattern results in strided memory accesses that limit bandwidth utilization. While TK's warp primitives simplify the implementation compared to the native kernel's manual shuffle-based reductions, they cannot overcome the fundamental compute pattern mismatch with tensor core architecture.
+
+TK will swizzle memory layouts by default as it expects most data to be loaded in chunks for eventual matmuls. This kernel breaks both of those design assumptions, and as such we get all of the overhead with none of the benefit.
+
+\subsubsection{Overall Assessment}
+The chunk-first TK kernel successfully leverages H100's warpgroup MMA capabilities to outperform the native CUDA implementation by up to 2x, demonstrating that TK's tile abstractions can enable both simpler code and better performance for matrix-heavy kernels. The sequence-first kernel, while correct and functionally complete, illustrates the challenges of applying TK to memory-bound, non-tiled workloads where high-level abstractions provide less benefit.
+
+
+\section{Conclusion}
+
+If you are citing published papers for which you are an author, refer
+to yourself in the third person. In particular, do not use phrases
+that reveal your identity (e.g., ``in previous work \cite{langley00}, we
+have shown \ldots'').
+
+Do not anonymize citations in the reference section. The only exception are manuscripts that are
+not yet published (e.g., under submission). If you choose to refer to
+such unpublished manuscripts \cite{anonymous}, anonymized copies have
+to be submitted
+as Supplementary Material via CMT\@. However, keep in mind that an MLSys
+paper should be self contained and should contain sufficient detail
+for the reviewers to evaluate the work. In particular, reviewers are
+not required to look at the Supplementary Material when writing their
+review.
+
+
+
+% Acknowledgements should only appear in the accepted version.
+\section*{Acknowledgements}
+
+\textbf{Do not} include acknowledgements in the initial version of
+the paper submitted for blind review.
+
+If a paper is accepted, the final camera-ready version can (and
+probably should) include acknowledgements. In this case, please
+place such acknowledgements in an unnumbered section at the
+end of the paper. Typically, this will include thanks to reviewers
+who gave useful comments, to colleagues who contributed to the ideas,
+and to funding agencies and corporate sponsors that provided financial
+support.
+
+
+% In the unusual situation where you want a paper to appear in the
+% references without citing it in the main text, use \nocite
+\nocite{langley00}
+
+\bibliography{example_paper}
+\bibliographystyle{mlsys2025}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SUPPLEMENTAL CONTENT AS APPENDIX AFTER REFERENCES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\appendix
+\section{Please add supplemental material as appendix here}
+%
+Put anything that you might normally include after the references as an appendix here, {\it not in a separate supplementary file}. Upload your final camera-ready as a single pdf, including all appendices.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\end{document}
+
+
+% This document was modified from the file originally made available by
+% Pat Langley and Andrea Danyluk for ICML-2K. This version was created
+% by Iain Murray in 2018. It was modified from a version from Dan Roy in
+% 2017, which was based on a version from Lise Getoor and Tobias
+% Scheffer, which was slightly modified from the 2010 version by
+% Thorsten Joachims & Johannes Fuernkranz, slightly modified from the
+% 2009 version by Kiri Wagstaff and Sam Roweis's 2008 version, which is
+% slightly modified from Prasad Tadepalli's 2007 version which is a
+% lightly changed version of the previous year's version by Andrew
+% Moore, which was in turn edited from those of Kristian Kersting and
+% Codrina Lauth. Alex Smola contributed to the algorithmic style files.
